@@ -9,8 +9,11 @@ const Analyzer = () => {
 
   const parseFile = async (file) => {
     const text = await file.text();
+    // Split by "FS No." to isolate each receipt
     const blocks = text.split(/FS No\.\s+/).slice(1);
     const allItems = [];
+
+    const footerKeywords = ["TXBL1", "TAX1", "TOTAL", "CASH", "ITEM#", "CHANGE", "^T^O^T^A^L", "SESSION Z REPORT"];
 
     blocks.forEach(block => {
       // 1. Metadata Extraction
@@ -21,24 +24,25 @@ const Analyzer = () => {
       const dateMatch = block.match(/(\d{2}\/\d{2}\/\d{4})/);
       const date = dateMatch ? dateMatch[0] : "";
 
-      const tinMatch = block.match(/BUYER'S TIN:\s*(\d+)/);
-      const buyerTIN = tinMatch ? tinMatch[1] : "";
+      const tinMatch = block.match(/BUYER'S TIN:\s*(\d+)/i);
+      const buyerTIN = tinMatch ? tinMatch[1] : "CASH";
 
-      // 2. Isolate Item Section
-      const separatorIndex = block.indexOf("----------------------------------------");
-      const itemSection = separatorIndex !== -1 ? block.substring(0, separatorIndex) : block;
-      const lines = itemSection.split("\n").map(l => l.trim()).filter(l => l);
-
+      // 2. State-Based Line Processing
+      const lines = block.split("\n").map(l => l.trim()).filter(l => l);
+      
       let tempReceiptItems = [];
-      let pendingQty = null;
+      let pendingQty = 1;
       let pendingUnitPrice = null;
 
-      // 3. Parse all lines including negative ones
-      lines.forEach((line) => {
-        // Pattern: Quantity line (e.g., "50 x *1,143.480" or "-50 x ...")
+      for (let line of lines) {
+        // Exit early if we hit the footer or a Z-Report section
+        if (footerKeywords.some(key => line.toUpperCase().includes(key))) break;
+        if (/[–-]{5,}/.test(line)) break;
+
+        // Pattern A: Quantity Line (e.g., "2 x *826.090")
         const qtyMatch = line.match(/^(-?\d+)\s*x\s*\*([\d,.]+)/);
-        // Pattern: Item line (e.g., "ST.GEORGE *-57,174.00")
-        const itemMatch = line.match(/^([A-Z\s\.\^0-9]+)\s*\*(-?[\d,.]+)/i);
+        // Pattern B: Item Line (e.g., "ST.GEORGE *1,652.18")
+        const itemMatch = line.match(/^([A-Z\s\.\^0-9\-]+)\s*\*(-?[\d,.]+)/i);
 
         if (qtyMatch) {
           pendingQty = parseInt(qtyMatch[1]);
@@ -47,10 +51,11 @@ const Analyzer = () => {
           const name = itemMatch[1].replace(/\^/g, "").trim();
           const lineTotal = parseFloat(itemMatch[2].replace(/,/g, ""));
           
-          // Skip header/footer noise
-          if (name === "FS No" || name.includes("TIN")) return;
+          // Skip if the "item name" is just metadata or noise
+          if (name === fsNo || name === date || name.includes("TIN") || name.length < 2) continue;
 
-          const qty = pendingQty !== null ? pendingQty : 1;
+          // If we had a pending unit price from the previous line, use it. 
+          // Otherwise, the lineTotal IS the unit price (Qty 1).
           const unitPrice = pendingUnitPrice !== null ? pendingUnitPrice : lineTotal;
 
           tempReceiptItems.push({
@@ -58,49 +63,43 @@ const Analyzer = () => {
             date,
             buyerTIN,
             item: name,
-            qty: qty,
+            qty: pendingQty,
             unitPrice: Math.abs(unitPrice).toFixed(2),
-            lineTotal: lineTotal // Keep raw total to detect negatives
+            lineTotal: lineTotal
           });
 
-          // Reset trackers
-          pendingQty = null;
+          // Reset state for next item
+          pendingQty = 1;
           pendingUnitPrice = null;
-        }
-      });
-
-      // 4. VOID CANCELLATION LOGIC
-      // We group items and filter out pairs that cancel each other out
-      const finalItemsForThisReceipt = [];
-      const processedIndices = new Set();
-
-      for (let i = 0; i < tempReceiptItems.length; i++) {
-        if (processedIndices.has(i)) continue;
-
-        const current = tempReceiptItems[i];
-
-        // If this is a positive item, look ahead for its negative "VOID" twin
-        if (current.lineTotal > 0) {
-          const voidIndex = tempReceiptItems.findIndex((item, idx) => 
-            idx > i && 
-            !processedIndices.has(idx) &&
-            item.item === current.item && 
-            item.lineTotal === -current.lineTotal
-          );
-
-          if (voidIndex !== -1) {
-            // Found a void! Mark both as processed so they aren't added
-            processedIndices.add(i);
-            processedIndices.add(voidIndex);
-          } else {
-            // No void found, this is a valid sale
-            current.lineTotal = current.lineTotal.toFixed(2);
-            finalItemsForThisReceipt.push(current);
-          }
         }
       }
 
-      allItems.push(...finalItemsForThisReceipt);
+      // 3. Void Filtering (Pairs positive and negative totals for the same item)
+      const survivors = [];
+      const usedIndices = new Set();
+
+      for (let i = 0; i < tempReceiptItems.length; i++) {
+        if (usedIndices.has(i)) continue;
+        const current = tempReceiptItems[i];
+
+        if (current.lineTotal > 0) {
+          const voidIdx = tempReceiptItems.findIndex((target, idx) => 
+            idx > i && 
+            !usedIndices.has(idx) && 
+            target.item === current.item && 
+            Math.abs(target.lineTotal + current.lineTotal) < 0.01
+          );
+
+          if (voidIdx !== -1) {
+            usedIndices.add(i);
+            usedIndices.add(voidIdx);
+          } else {
+            current.lineTotal = current.lineTotal.toFixed(2);
+            survivors.push(current);
+          }
+        }
+      }
+      allItems.push(...survivors);
     });
 
     setItems(allItems);
@@ -108,50 +107,50 @@ const Analyzer = () => {
 
   const exportExcel = () => {
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(items), "Receipt Items");
-    XLSX.writeFile(wb, "Receipt_Data_Cleaned.xlsx");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(items), "Consolidated Sales");
+    XLSX.writeFile(wb, "Receipt_Data_Export.xlsx");
   };
 
   return (
-    <div className="p-8 max-w-6xl mx-auto">
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-2xl font-bold">Ethiopian Receipt Analyzer (Partial Void Support)</h1>
-        {items.length > 0 && (
-          <button onClick={exportExcel} className="bg-green-600 text-white px-4 py-2 rounded shadow hover:bg-green-700">
-            Export {items.length} Items to Excel
-          </button>
-        )}
-      </div>
-      
-      <div className="mb-8 bg-blue-50 p-6 rounded-lg border border-blue-200">
-        <input 
-          type="file" accept=".txt" 
-          onChange={(e) => parseFile(e.target.files[0])}
-          className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-700"
-        />
-        <p className="text-xs text-blue-600 mt-2">Automatically detects and removes items followed by a VOID correction line.</p>
+    <div className="p-2 max-w-6xl mx-auto font-sans bg-gray-50 min-h-screen">
+      <div className="bg-white p-2 rounded-2xl shadow-sm border border-gray-200 mb-8">
+        <h1 className="text-3xl font-bold text-gray-900">Ethiopian Receipt Parser</h1>
+        <p className="text-gray-500 mt-2">Processes split quantity lines, multi-item receipts, and Buyer TINs.</p>
+        
+        <div className="mt-6 flex items-center gap-4 bg-blue-50 p-4 rounded-xl border border-blue-100">
+          <input 
+            type="file" accept=".txt" 
+            onChange={(e) => parseFile(e.target.files[0])}
+            className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-6 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-blue-600 file:text-white hover:file:bg-blue-700 cursor-pointer"
+          />
+          {items.length > 0 && (
+            <button onClick={exportExcel} className="bg-green-600 text-white px-8 py-2 rounded-lg font-bold hover:bg-green-700 shadow-lg transition-all">
+              Download Excel ({items.length} Items)
+            </button>
+          )}
+        </div>
       </div>
 
       {items.length > 0 && (
-        <div className="border rounded-lg overflow-hidden bg-white shadow-lg">
+        <div className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden">
           <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-50">
+            <thead className="bg-gray-100">
               <tr>
-                {["FS No", "Date", "Buyer TIN", "Item Name", "Qty", "Unit Price", "Line Total"].map(h => (
-                  <th key={h} className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">{h}</th>
+                {["FS No", "Date", "Buyer TIN", "Product", "Qty", "Price", "Total"].map(h => (
+                  <th key={h} className="px-6 py-4 text-left text-[10px] font-black text-gray-400 uppercase tracking-widest">{h}</th>
                 ))}
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-200">
+            <tbody className="divide-y divide-gray-100 bg-white">
               {items.map((it, idx) => (
-                <tr key={idx} className="hover:bg-gray-50">
-                  <td className="px-4 py-2 text-sm text-gray-600">{it.fsNo}</td>
-                  <td className="px-4 py-2 text-sm text-gray-600">{it.date}</td>
-                  <td className="px-4 py-2 text-sm text-gray-400 font-mono">{it.buyerTIN || "-"}</td>
-                  <td className="px-4 py-2 text-sm font-medium text-gray-900">{it.item}</td>
-                  <td className="px-4 py-2 text-sm text-gray-600">{it.qty}</td>
-                  <td className="px-4 py-2 text-sm text-gray-600">{it.unitPrice}</td>
-                  <td className="px-4 py-2 text-sm font-bold text-blue-600">{it.lineTotal}</td>
+                <tr key={idx} className="hover:bg-blue-50/30">
+                  <td className="px-6 py-4 text-sm font-mono text-gray-500">#{it.fsNo}</td>
+                  <td className="px-6 py-4 text-sm text-gray-600">{it.date}</td>
+                  <td className="px-6 py-4 text-sm font-mono text-blue-500 font-bold">{it.buyerTIN}</td>
+                  <td className="px-6 py-4 text-sm font-bold text-gray-800">{it.item}</td>
+                  <td className="px-6 py-4 text-sm text-gray-600">{it.qty}</td>
+                  <td className="px-6 py-4 text-sm text-gray-600">{it.unitPrice}</td>
+                  <td className="px-6 py-4 text-sm font-black text-gray-900">{it.lineTotal}</td>
                 </tr>
               ))}
             </tbody>
