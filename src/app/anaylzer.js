@@ -3,13 +3,50 @@
 import { useState } from "react";
 import * as XLSX from "xlsx";
 import React from 'react';
+import {
+  flexRender,
+  getCoreRowModel,
+  getSortedRowModel,
+  useReactTable,
+  getPaginationRowModel
+} from "@tanstack/react-table";
 
 const Analyzer = () => {
   const [items, setItems] = useState([]);
+  const [sorting, setSorting] = useState([]);
+   const [pagination, setPagination] = useState({
+    pageIndex: 0,
+    pageSize: 20,
+  });
+ const columns = [
+  { accessorKey: "fsNo", header: "FS No" },
+  { accessorKey: "date", header: "Date" },
+  { accessorKey: "customerTin", header: "Customer TIN" },
+  { accessorKey: "mrc", header: "MRC" },
+  { accessorKey: "buyerTin", header: "Buyer TIN" },
+  { accessorKey: "item", header: "Product" },
+  { accessorKey: "qty", header: "Qty" },
+  { accessorKey: "lineTotal", header: "Total" },
+];
+
+const table = useReactTable({
+    data:items,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+     getPaginationRowModel: getPaginationRowModel(),
+  });
+
+  // Helper to strip non-numeric characters except decimals
+  const cleanValue = (val) => {
+    if (!val) return "";
+    return val.toString().replace(/[^\d.-]/g, "");
+  };
 
   const parseFile = async (file) => {
     const text = await file.text();
-    // Split by "FS No." to isolate each receipt
     const blocks = text.split(/FS No\.\s+/).slice(1);
     const allItems = [];
 
@@ -19,13 +56,18 @@ const Analyzer = () => {
       // 1. Metadata Extraction
       const fsNoMatch = block.match(/^(\d+)/);
       if (!fsNoMatch) return;
-      const fsNo = fsNoMatch[1];
+      const fsNo = cleanValue(fsNoMatch[1]); // Clean FS Number
 
       const dateMatch = block.match(/(\d{2}\/\d{2}\/\d{4})/);
       const date = dateMatch ? dateMatch[0] : "";
 
-      const tinMatch = block.match(/BUYER'S TIN:\s*(\d+)/i);
-      const buyerTIN = tinMatch ? tinMatch[1] : "CASH";
+      const merchantTinMatch = block.match(/TIN:\s*(0011516616)/);
+      const machineIdMatch = block.match(/{logo}\d+/);
+      const buyerTinMatch = block.match(/BUYER'S TIN:\s*(\d+)/i);
+
+      const customerTin = merchantTinMatch ? cleanValue(merchantTinMatch[1]) : "0011516616";
+      const mrc = machineIdMatch ? machineIdMatch[0] : "FGE0010870";
+      const buyerTin = buyerTinMatch ? cleanValue(buyerTinMatch[1]) : "";
 
       // 2. State-Based Line Processing
       const lines = block.split("\n").map(l => l.trim()).filter(l => l);
@@ -35,46 +77,41 @@ const Analyzer = () => {
       let pendingUnitPrice = null;
 
       for (let line of lines) {
-        // Exit early if we hit the footer or a Z-Report section
         if (footerKeywords.some(key => line.toUpperCase().includes(key))) break;
         if (/[–-]{5,}/.test(line)) break;
 
-        // Pattern A: Quantity Line (e.g., "2 x *826.090")
         const qtyMatch = line.match(/^(-?\d+)\s*x\s*\*([\d,.]+)/);
-        // Pattern B: Item Line (e.g., "ST.GEORGE *1,652.18")
         const itemMatch = line.match(/^([A-Z\s\.\^0-9\-]+)\s*\*(-?[\d,.]+)/i);
 
         if (qtyMatch) {
           pendingQty = parseInt(qtyMatch[1]);
-          pendingUnitPrice = parseFloat(qtyMatch[2].replace(/,/g, ""));
+          pendingUnitPrice = parseFloat(cleanValue(qtyMatch[2]));
         } else if (itemMatch) {
           const name = itemMatch[1].replace(/\^/g, "").trim();
-          const lineTotal = parseFloat(itemMatch[2].replace(/,/g, ""));
+          const lineTotal = parseFloat(cleanValue(itemMatch[2]));
           
-          // Skip if the "item name" is just metadata or noise
           if (name === fsNo || name === date || name.includes("TIN") || name.length < 2) continue;
 
-          // If we had a pending unit price from the previous line, use it. 
-          // Otherwise, the lineTotal IS the unit price (Qty 1).
           const unitPrice = pendingUnitPrice !== null ? pendingUnitPrice : lineTotal;
 
           tempReceiptItems.push({
             fsNo,
             date,
-            buyerTIN,
+            customerTin,
+            mrc,
+            buyerTin,
             item: name,
             qty: pendingQty,
             unitPrice: Math.abs(unitPrice).toFixed(2),
-            lineTotal: lineTotal
+            lineTotal: lineTotal // Raw number for math
           });
 
-          // Reset state for next item
           pendingQty = 1;
           pendingUnitPrice = null;
         }
       }
 
-      // 3. Void Filtering (Pairs positive and negative totals for the same item)
+      // 3. Mathematical Void Filtering
       const survivors = [];
       const usedIndices = new Set();
 
@@ -94,6 +131,7 @@ const Analyzer = () => {
             usedIndices.add(i);
             usedIndices.add(voidIdx);
           } else {
+            // Convert to clean string for final output
             current.lineTotal = current.lineTotal.toFixed(2);
             survivors.push(current);
           }
@@ -107,56 +145,104 @@ const Analyzer = () => {
 
   const exportExcel = () => {
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(items), "Consolidated Sales");
-    XLSX.writeFile(wb, "Receipt_Data_Export.xlsx");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(items), "Clean Sales Data");
+    XLSX.writeFile(wb, "Receipt_Data_Clean_Values.xlsx");
   };
 
   return (
-    <div className="p-2 max-w-6xl mx-auto font-sans bg-gray-50 min-h-screen">
-      <div className="bg-white p-2 rounded-2xl shadow-sm border border-gray-200 mb-8">
-        <h1 className="text-3xl font-bold text-gray-900">Ethiopian Receipt Parser</h1>
-        <p className="text-gray-500 mt-2">Processes split quantity lines, multi-item receipts, and Buyer TINs.</p>
-        
-        <div className="mt-6 flex items-center gap-4 bg-blue-50 p-4 rounded-xl border border-blue-100">
+    <div className="p-2 max-w-7xl mx-auto font-sans bg-gray-50 min-h-screen">
+      <div className="bg-white p-2 rounded-lg shadow-sm border border-gray-200 mb-3 text-center flex items-center">
+        <h1 className="text-lg font-black text-gray-900 tracking-tight mr-2">Receipt Analyzer</h1>
+        <div className="my-1 flex justify-center items-center gap-4">
           <input 
             type="file" accept=".txt" 
             onChange={(e) => parseFile(e.target.files[0])}
-            className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-6 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-blue-600 file:text-white hover:file:bg-blue-700 cursor-pointer"
+            className="text-sm text-gray-500 file:mr-4 file:py-2 file:px-6 file:rounded-full file:border-0 file:text-sm file:font-bold file:bg-blue-600 file:text-white hover:file:bg-blue-700 cursor-pointer shadow-md"
           />
           {items.length > 0 && (
-            <button onClick={exportExcel} className="bg-green-600 text-white px-8 py-2 rounded-lg font-bold hover:bg-green-700 shadow-lg transition-all">
-              Download Excel ({items.length} Items)
+            <button onClick={exportExcel} className="bg-green-600 text-white px-8 py-2 rounded-full font-bold hover:bg-green-700 shadow-md transition-all">
+              Export Excel ({items.length} Lines)
             </button>
           )}
         </div>
       </div>
 
-      {items.length > 0 && (
-        <div className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden">
-          <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-100">
-              <tr>
-                {["FS No", "Date", "Buyer TIN", "Product", "Qty", "Price", "Total"].map(h => (
-                  <th key={h} className="px-6 py-4 text-left text-[10px] font-black text-gray-400 uppercase tracking-widest">{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100 bg-white">
-              {items.map((it, idx) => (
-                <tr key={idx} className="hover:bg-blue-50/30">
-                  <td className="px-6 py-4 text-sm font-mono text-gray-500">#{it.fsNo}</td>
-                  <td className="px-6 py-4 text-sm text-gray-600">{it.date}</td>
-                  <td className="px-6 py-4 text-sm font-mono text-blue-500 font-bold">{it.buyerTIN}</td>
-                  <td className="px-6 py-4 text-sm font-bold text-gray-800">{it.item}</td>
-                  <td className="px-6 py-4 text-sm text-gray-600">{it.qty}</td>
-                  <td className="px-6 py-4 text-sm text-gray-600">{it.unitPrice}</td>
-                  <td className="px-6 py-4 text-sm font-black text-gray-900">{it.lineTotal}</td>
-                </tr>
+     <div className="bg-white rounded-xl shadow border overflow-hidden">
+      
+      <table className="min-w-full text-xs">
+        <thead className="bg-gray-100 text-black">
+          {table.getHeaderGroups().map(hg => (
+            <tr key={hg.id}>
+              {hg.headers.map(header => (
+                <th
+                  key={header.id}
+                  onClick={header.column.getToggleSortingHandler()}
+                  className="px-4 py-3 text-left font-bold uppercase cursor-pointer select-none"
+                >
+                  {flexRender(header.column.columnDef.header, header.getContext())}
+                  {header.column.getIsSorted() === "asc" && " ↑"}
+                  {header.column.getIsSorted() === "desc" && " ↓"}
+                </th>
               ))}
-            </tbody>
-          </table>
+            </tr>
+          ))}
+        </thead>
+
+        <tbody className="divide-y">
+          {table.getRowModel().rows.map(row => (
+            <tr key={row.id} className="hover:bg-blue-50">
+              {row.getVisibleCells().map(cell => (
+                <td key={cell.id} className="px-4 py-2">
+                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {/* Pagination */}
+      <div className="flex items-center justify-between p-4 text-xs bg-gray-50">
+        <div>
+          Page {table.getState().pagination.pageIndex + 1} of{" "}
+          {table.getPageCount()}
         </div>
-      )}
+
+        <div className="flex gap-2">
+          <button
+            onClick={() => table.setPageIndex(0)}
+            disabled={!table.getCanPreviousPage()}
+            className="px-3 py-1 border rounded disabled:opacity-40"
+          >
+            ⏮ First
+          </button>
+
+          <button
+            onClick={() => table.previousPage()}
+            disabled={!table.getCanPreviousPage()}
+            className="px-3 py-1 border rounded disabled:opacity-40"
+          >
+            ◀ Prev
+          </button>
+
+          <button
+            onClick={() => table.nextPage()}
+            disabled={!table.getCanNextPage()}
+            className="px-3 py-1 border rounded disabled:opacity-40"
+          >
+            Next ▶
+          </button>
+
+          <button
+            onClick={() => table.setPageIndex(table.getPageCount() - 1)}
+            disabled={!table.getCanNextPage()}
+            className="px-3 py-1 border rounded disabled:opacity-40"
+          >
+            Last ⏭
+          </button>
+        </div>
+      </div>
+    </div>
     </div>
   );
 };

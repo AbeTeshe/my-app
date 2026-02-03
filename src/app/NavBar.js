@@ -4,7 +4,7 @@ import { Bell, User, LogOut } from "lucide-react";
 
 export default function Navbar() {
   return (
-    <header className="h-14 bg-white border-b shadow-sm flex items-center justify-between px-6">
+    <header className="h-14 bg-white shadow-sm flex items-center justify-between px-2">
       
       <div className="text-sm text-gray-600 font-medium">
         Receipt Analyzer System
