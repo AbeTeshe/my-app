@@ -19,11 +19,11 @@ const Analyzer = () => {
     pageSize: 20,
   });
  const columns = [
-  { accessorKey: "fsNo", header: "FS No" },
-  { accessorKey: "date", header: "Date" },
   { accessorKey: "customerTin", header: "Customer TIN" },
-  { accessorKey: "mrc", header: "MRC" },
+   { accessorKey: "mrc", header: "MRC" },
+  { accessorKey: "fsNo", header: "FS No" },
   { accessorKey: "buyerTin", header: "Buyer TIN" },
+  { accessorKey: "date", header: "Date" },
   { accessorKey: "item", header: "Product" },
   { accessorKey: "qty", header: "Qty" },
   { accessorKey: "lineTotal", header: "Total" },
